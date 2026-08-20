@@ -17,13 +17,21 @@ import (
 )
 
 func Benchmark_H3XHTTP_packetUpRoundTrip(b *testing.B) {
+	benchmarkH3XHTTPRoundTrip(b, "packet-up")
+}
+
+func Benchmark_H3XHTTP_streamOneRoundTrip(b *testing.B) {
+	benchmarkH3XHTTPRoundTrip(b, "stream-one")
+}
+
+func benchmarkH3XHTTPRoundTrip(b *testing.B, mode string) {
 	listenPort := udp.PickPort()
 	certificate, certificateHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
 	streamSettings := &internet.MemoryStreamConfig{
 		ProtocolName: "splithttp",
 		ProtocolSettings: &Config{
 			Path: "benchmark",
-			Mode: "packet-up",
+			Mode: mode,
 			ScMaxEachPostBytes: &RangeConfig{
 				From: 64 * 1024,
 				To:   64 * 1024,
@@ -67,18 +75,38 @@ func Benchmark_H3XHTTP_packetUpRoundTrip(b *testing.B) {
 	}
 	b.Cleanup(func() { _ = conn.Close() })
 
-	for _, benchmark := range []struct {
-		name string
-		size int
-	}{
-		{name: "1KiB", size: 1024},
-		{name: "64KiB", size: 64 * 1024},
-	} {
+	type benchmarkCase struct {
+		name   string
+		size   int
+		chunks int
+	}
+	benchmarks := []benchmarkCase{
+		{name: "64B", size: 64, chunks: 1},
+		{name: "1KiB", size: 1024, chunks: 1},
+		{name: "4KiB", size: 4 * 1024, chunks: 1},
+	}
+	if mode == "stream-one" {
+		benchmarks = append(benchmarks, benchmarkCase{name: "16x256B", size: 16 * 256, chunks: 16})
+	}
+	benchmarks = append(benchmarks,
+		benchmarkCase{name: "64KiB", size: 64 * 1024, chunks: 1},
+		benchmarkCase{name: "1MiB", size: 1024 * 1024, chunks: 1},
+	)
+	for _, benchmark := range benchmarks {
 		b.Run(benchmark.name, func(b *testing.B) {
 			payload := bytes.Repeat([]byte{0x5a}, benchmark.size)
 			received := make([]byte, benchmark.size)
+			chunkSize := benchmark.size / benchmark.chunks
+			writePayload := func() error {
+				for start := 0; start < len(payload); start += chunkSize {
+					if _, err := conn.Write(payload[start : start+chunkSize]); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
 
-			if _, err := conn.Write(payload); err != nil {
+			if err := writePayload(); err != nil {
 				b.Fatal(err)
 			}
 			if _, err := io.ReadFull(conn, received); err != nil {
@@ -92,7 +120,7 @@ func Benchmark_H3XHTTP_packetUpRoundTrip(b *testing.B) {
 			b.SetBytes(int64(benchmark.size))
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := conn.Write(payload); err != nil {
+				if err := writePayload(); err != nil {
 					b.Fatal(err)
 				}
 				if _, err := io.ReadFull(conn, received); err != nil {

@@ -67,7 +67,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	}
 	c.transportConfig.FillStreamRequest(req, sessionId, "")
 
-	wrc = &WaitReadCloser{Wait: make(chan struct{})}
+	wrc = newWaitReadCloser()
 	go func() {
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -189,36 +189,81 @@ func (c *DefaultDialerClient) Close() error {
 type WaitReadCloser struct {
 	Wait chan struct{}
 	io.ReadCloser
+
+	mu     sync.Mutex
+	ready  bool
+	closed bool
+}
+
+func newWaitReadCloser() *WaitReadCloser {
+	return &WaitReadCloser{Wait: make(chan struct{})}
+}
+
+func (w *WaitReadCloser) initWaitLocked() {
+	if w.Wait == nil {
+		w.Wait = make(chan struct{})
+	}
+}
+
+func (w *WaitReadCloser) signalReadyLocked() {
+	if !w.ready {
+		close(w.Wait)
+		w.ready = true
+	}
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
+	w.mu.Lock()
+	w.initWaitLocked()
+	if w.closed || w.ReadCloser != nil {
+		w.signalReadyLocked()
+		w.mu.Unlock()
+		_ = rc.Close()
+		return
+	}
 	w.ReadCloser = rc
-	defer func() {
-		if recover() != nil {
-			rc.Close()
-		}
-	}()
-	close(w.Wait)
+	w.signalReadyLocked()
+	w.mu.Unlock()
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	if w.ReadCloser == nil {
-		if <-w.Wait; w.ReadCloser == nil {
+	w.mu.Lock()
+	w.initWaitLocked()
+	if w.closed {
+		w.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	reader := w.ReadCloser
+	wait := w.Wait
+	w.mu.Unlock()
+
+	if reader == nil {
+		<-wait
+		w.mu.Lock()
+		if w.closed || w.ReadCloser == nil {
+			w.mu.Unlock()
 			return 0, io.ErrClosedPipe
 		}
+		reader = w.ReadCloser
+		w.mu.Unlock()
 	}
-	return w.ReadCloser.Read(b)
+	return reader.Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
-	if w.ReadCloser != nil {
-		return w.ReadCloser.Close()
+	w.mu.Lock()
+	w.initWaitLocked()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
 	}
-	defer func() {
-		if recover() != nil && w.ReadCloser != nil {
-			w.ReadCloser.Close()
-		}
-	}()
-	close(w.Wait)
-	return nil
+	w.closed = true
+	reader := w.ReadCloser
+	w.ReadCloser = nil
+	w.signalReadyLocked()
+	w.mu.Unlock()
+	if reader == nil {
+		return nil
+	}
+	return reader.Close()
 }

@@ -312,6 +312,9 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		uploadRawPool:  &sync.Pool{},
 		dialUploadConn: dialContext,
 	}
+	if httpVersion == "3" && transportConfig.Mode == "stream-one" {
+		return newH3StreamClient(client, transport.(*http3.Transport))
+	}
 
 	return client
 }
@@ -433,9 +436,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 	var closed atomic.Int32
 
-	reader, writer := io.Pipe()
 	conn := splitConn{
-		writer: writer,
 		onClose: func() {
 			if closed.Add(1) > 1 {
 				return
@@ -455,19 +456,29 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, false)
+		if h3Client, ok := httpClient.(h3StreamOneOpener); ok {
+			conn.reader, conn.writer, conn.remoteAddr, conn.localAddr, err = h3Client.OpenH3StreamOne(ctx, requestURL.String())
+		} else {
+			reader, writer := io.Pipe()
+			conn.writer = writer
+			conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, false)
+		}
 		if err != nil { // browser dialer only
+			conn.onClose()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
-	} else { // stream-down
-		if xmuxClient2 != nil {
-			xmuxClient2.LeftRequests.Add(-1)
-		}
-		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
-		if err != nil { // browser dialer only
-			return nil, err
-		}
+	}
+
+	reader, writer := io.Pipe()
+	conn.writer = writer
+	if xmuxClient2 != nil {
+		xmuxClient2.LeftRequests.Add(-1)
+	}
+	conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
+	if err != nil { // browser dialer only
+		conn.onClose()
+		return nil, err
 	}
 	if mode == "stream-up" {
 		if xmuxClient != nil {
