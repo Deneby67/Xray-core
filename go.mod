@@ -58,3 +58,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/apernet/quic-go => github.com/Deneby67/quic-go v0.59.1-0.20260820165306-8adc764a51d8
