@@ -15,6 +15,7 @@ require (
 	github.com/pelletier/go-toml v1.9.5
 	github.com/pion/stun/v3 v3.1.6
 	github.com/pires/go-proxyproto v0.15.0
+	github.com/quic-go/quic-go v0.61.0
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sagernet/sing v0.5.1
@@ -60,3 +61,5 @@ require (
 )
 
 replace github.com/apernet/quic-go => github.com/Deneby67/quic-go v0.59.1-0.20260820165306-8adc764a51d8
+
+replace github.com/quic-go/quic-go => github.com/Deneby67/quic-go v0.61.1-0.20260820223728-10ee125b7d7f

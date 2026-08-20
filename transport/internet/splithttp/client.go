@@ -9,7 +9,7 @@ import (
 	"net/http/httptrace"
 	"sync"
 
-	"github.com/apernet/quic-go/http3"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"

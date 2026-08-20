@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apernet/quic-go/http3"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/require"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"

@@ -44,6 +44,26 @@ func TestSetMaxDatagramSizeClampsCongestionWindow(t *testing.T) {
 	require.Equal(t, b.minCongestionWindow, b.recoveryWindow)
 }
 
+func TestSetMaxDatagramSizeHandlesPathMTUDecrease(t *testing.T) {
+	const initialMaxDatagramSize = congestion.ByteCount(1280)
+	const discoveredMaxDatagramSize = congestion.ByteCount(1450)
+
+	b := NewBbrSender(DefaultClock{}, initialMaxDatagramSize, ProfileStandard)
+	for _, size := range []congestion.ByteCount{discoveredMaxDatagramSize, 1200, initialMaxDatagramSize} {
+		b.SetMaxDatagramSize(size)
+		require.GreaterOrEqual(t, b.congestionWindow, b.minCongestionWindow)
+		require.LessOrEqual(t, b.congestionWindow, b.maxCongestionWindow)
+		require.GreaterOrEqual(t, b.recoveryWindow, b.minCongestionWindow)
+		require.LessOrEqual(t, b.recoveryWindow, b.maxCongestionWindow)
+	}
+
+	require.Equal(t, initialMaxDatagramSize, b.maxDatagramSize)
+	require.Equal(t, initialCongestionWindowPackets*initialMaxDatagramSize, b.initialCongestionWindow)
+	require.Equal(t, congestion.MaxCongestionWindowPackets*initialMaxDatagramSize, b.maxCongestionWindow)
+	require.Equal(t, minCongestionWindowPackets*initialMaxDatagramSize, b.minCongestionWindow)
+	require.Equal(t, b.initialCongestionWindow, b.congestionWindow)
+}
+
 func TestNewBbrSenderAppliesProfiles(t *testing.T) {
 	testCases := []struct {
 		name                                string

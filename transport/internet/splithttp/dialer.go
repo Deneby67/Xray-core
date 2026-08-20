@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/apernet/quic-go"
-	"github.com/apernet/quic-go/http3"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -26,7 +26,6 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/browser_dialer"
-	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/hysteria/udphop"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -261,14 +260,9 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				}
 				context.AfterFunc(conn.Context(), func() { pktConn.Close() })
 
-				switch quicParams.Congestion {
-				case "reno":
-				case "", "bbr":
-					congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
-				case "force-brutal":
-					congestion.UseBrutal(conn, quicParams.BrutalUp)
-				default:
-					panic(quicParams.Congestion)
+				if err := configureH3Congestion(conn, quicParams); err != nil {
+					_ = conn.CloseWithError(0, "")
+					return nil, err
 				}
 
 				return conn, nil

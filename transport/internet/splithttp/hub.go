@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apernet/quic-go"
-	"github.com/apernet/quic-go/http3"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -23,7 +23,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -600,14 +599,9 @@ func (l *QListener) Accept(ctx context.Context) (*quic.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch l.quicParams.Congestion {
-	case "reno":
-	case "", "bbr":
-		congestion.UseBBR(conn, bbr.Profile(l.quicParams.BbrProfile))
-	case "force-brutal":
-		congestion.UseBrutal(conn, l.quicParams.BrutalUp)
-	default:
-		panic(l.quicParams.Congestion)
+	if err := configureH3Congestion(conn, l.quicParams); err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
 	}
 	return conn, nil
 }
