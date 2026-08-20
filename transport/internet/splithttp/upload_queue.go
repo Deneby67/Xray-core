@@ -6,16 +6,23 @@ package splithttp
 import (
 	"container/heap"
 	"io"
+	"sync"
 	"sync/atomic"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/signal/done"
 )
 
 type Packet struct {
-	Reader  *httpServerConn
-	Payload []byte
-	Seq     uint64
+	Reader             *httpServerConn
+	Payload            []byte
+	payloadMultiBuffer buf.MultiBuffer
+	Seq                uint64
+}
+
+func (p *Packet) release() {
+	p.payloadMultiBuffer = buf.ReleaseMulti(p.payloadMultiBuffer)
 }
 
 type uploadQueue struct {
@@ -25,6 +32,8 @@ type uploadQueue struct {
 	nextSeq       uint64
 	maxPackets    int
 	closed        *done.Instance
+	pushMu        sync.RWMutex
+	readMu        sync.Mutex
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
@@ -37,8 +46,17 @@ func NewUploadQueue(maxPackets int) *uploadQueue {
 	}
 }
 
+// Push takes ownership of p, including when it returns an error.
 func (h *uploadQueue) Push(p Packet) error {
+	h.pushMu.RLock()
+	defer h.pushMu.RUnlock()
+
+	if h.closed.Done() {
+		p.release()
+		return errors.New("packet queue closed")
+	}
 	if h.reader.Load() != nil || (p.Reader != nil && !h.reader.CompareAndSwap(nil, p.Reader)) {
+		p.release()
 		return errors.New("h.reader already exists")
 	}
 	select {
@@ -48,16 +66,26 @@ func (h *uploadQueue) Push(p Packet) error {
 		}
 		return nil
 	case <-h.closed.Wait():
+		p.release()
 		return errors.New("packet queue closed")
 	}
 }
 
 func (h *uploadQueue) Close() error {
 	h.closed.Close()
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+
+	var closeErr error
 	if reader := h.reader.Load(); reader != nil {
-		return reader.Close()
+		closeErr = reader.Close()
 	}
-	return nil
+
+	h.readMu.Lock()
+	h.releasePending()
+	h.readMu.Unlock()
+
+	return closeErr
 }
 
 func (h *uploadQueue) Read(b []byte) (int, error) {
@@ -65,29 +93,55 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 		return reader.Read(b)
 	}
 
+	h.readMu.Lock()
+	n, err, closeQueue := h.readPackets(b)
+	h.readMu.Unlock()
+
+	if closeQueue {
+		_ = h.Close()
+	}
+	if n == 0 && err == nil {
+		if reader := h.reader.Load(); reader != nil {
+			return reader.Read(b)
+		}
+	}
+	return n, err
+}
+
+func (h *uploadQueue) readPackets(b []byte) (int, error, bool) {
 	if h.closed.Done() {
-		return 0, io.EOF
+		return 0, io.EOF, false
 	}
 
 	if len(h.heap) == 0 {
 		select {
 		case p := <-h.pushedPackets:
 			if p.Reader != nil {
-				return p.Reader.Read(b)
+				return 0, nil, false
 			}
 			heap.Push(&h.heap, p)
 		case <-h.closed.Wait():
-			return 0, io.EOF
+			return 0, io.EOF, false
 		}
 	}
 
 	for len(h.heap) > 0 {
 		packet := heap.Pop(&h.heap).(Packet)
-		n := 0
 
 		if packet.Seq == h.nextSeq {
+			if !packet.payloadMultiBuffer.IsEmpty() {
+				var n int
+				packet.payloadMultiBuffer, n = buf.SplitBytes(packet.payloadMultiBuffer, b)
+				if packet.payloadMultiBuffer.IsEmpty() {
+					h.nextSeq = packet.Seq + 1
+				} else {
+					heap.Push(&h.heap, packet)
+				}
+				return n, nil, false
+			}
+
 			copy(b, packet.Payload)
-			n = min(len(b), len(packet.Payload))
+			n := min(len(b), len(packet.Payload))
 
 			if n < len(packet.Payload) {
 				// partial read
@@ -97,7 +151,7 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 				h.nextSeq = packet.Seq + 1
 			}
 
-			return n, nil
+			return n, nil, false
 		}
 
 		// misordered packet
@@ -106,19 +160,36 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 				// the "reassembly buffer" is too large, and we want to
 				// constrain memory usage somehow. let's tear down the
 				// connection, and hope the application retries.
-				return 0, errors.New("packet queue is too large")
+				packet.release()
+				return 0, errors.New("packet queue is too large"), true
 			}
 			heap.Push(&h.heap, packet)
 			select {
 			case p := <-h.pushedPackets:
 				heap.Push(&h.heap, p)
 			case <-h.closed.Wait():
-				return 0, io.EOF
+				return 0, io.EOF, false
 			}
 		}
 	}
 
-	return 0, nil
+	return 0, nil, false
+}
+
+func (h *uploadQueue) releasePending() {
+	for len(h.heap) > 0 {
+		packet := heap.Pop(&h.heap).(Packet)
+		packet.release()
+	}
+
+	for {
+		select {
+		case packet := <-h.pushedPackets:
+			packet.release()
+		default:
+			return
+		}
+	}
 }
 
 // heap code directly taken from https://pkg.go.dev/container/heap

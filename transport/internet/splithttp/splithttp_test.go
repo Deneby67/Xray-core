@@ -239,6 +239,7 @@ func Test_ListenXHAndDial_QUIC(t *testing.T) {
 		ProtocolName: "splithttp",
 		ProtocolSettings: &Config{
 			Path: "shs",
+			Mode: "packet-up",
 		},
 		SecurityType: "tls",
 		SecuritySettings: &tls.Config{

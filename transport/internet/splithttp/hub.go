@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +21,6 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
@@ -156,27 +154,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
-	var remoteAddr net.Addr
 	var err error
-	remoteAddr, err = net.ResolveTCPAddr("tcp", request.RemoteAddr)
-	if err != nil {
-		remoteAddr = &net.TCPAddr{
-			IP:   []byte{0, 0, 0, 0},
-			Port: 0,
-		}
-	}
-	if request.ProtoMajor == 3 {
-		remoteAddr = &net.UDPAddr{
-			IP:   remoteAddr.(*net.TCPAddr).IP,
-			Port: remoteAddr.(*net.TCPAddr).Port,
-		}
-	}
-	var trustedXFF []string
-	if h.socketSettings != nil {
-		trustedXFF = h.socketSettings.TrustedXForwardedFor
-	}
-	remoteAddr = http_proto.ApplyTrustedXForwardedFor(request.Header, trustedXFF, remoteAddr)
-
 	var currentSession *httpSession
 	if sessionId != "" {
 		currentSession = h.upsertSession(sessionId)
@@ -284,6 +262,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}
 
 		var bodyPayload []byte
+		var bodyPayloadMultiBuffer buf.MultiBuffer
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
 			var readErr error
 			if request.ContentLength > int64(scMaxEachPostBytes) {
@@ -292,8 +271,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				return
 			}
 			if request.ContentLength > 0 {
-				bodyPayload = make([]byte, request.ContentLength)
-				_, readErr = io.ReadFull(request.Body, bodyPayload)
+				bodyPayloadMultiBuffer, readErr = readPacketBody(request.Body, request.ContentLength)
 			} else {
 				bodyPayload, readErr = buf.ReadAllToBytes(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
 			}
@@ -304,19 +282,25 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			}
 		}
 
-		var payload []byte
+		hasBodyPayload := len(bodyPayload) > 0 || !bodyPayloadMultiBuffer.IsEmpty()
+		var payload packetPayload
 		switch dataPlacement {
 		case PlacementHeader:
-			payload = headerPayload
+			payload.appendBytes(headerPayload)
 		case PlacementCookie:
-			payload = cookiePayload
+			payload.appendBytes(cookiePayload)
 		case PlacementBody:
-			payload = bodyPayload
+			payload.appendBytes(bodyPayload)
+			payload.appendMultiBuffer(bodyPayloadMultiBuffer)
 		case PlacementAuto:
-			payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+			payload.appendBytes(headerPayload)
+			payload.appendBytes(cookiePayload)
+			payload.appendBytes(bodyPayload)
+			payload.appendMultiBuffer(bodyPayloadMultiBuffer)
 		}
 
-		if len(payload) > scMaxEachPostBytes {
+		if payload.len() > scMaxEachPostBytes {
+			payload.release()
 			errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.")
 			writer.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
@@ -324,28 +308,27 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		seq, err := strconv.ParseUint(seqStr, 10, 64)
 		if err != nil {
+			payload.release()
 			errors.LogInfoInner(context.Background(), err, "failed to upload (ParseUint)")
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		err = currentSession.uploadQueue.Push(Packet{
-			Payload: payload,
-			Seq:     seq,
-		})
+		err = currentSession.uploadQueue.Push(payload.packet(seq))
 		if err != nil {
 			errors.LogInfoInner(context.Background(), err, "failed to upload (PushPayload)")
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		if len(bodyPayload) == 0 {
+		if !hasBodyPayload {
 			// Methods without a body are usually cached by default.
 			writer.Header().Set("Cache-Control", "no-store")
 		}
 
 		writer.WriteHeader(http.StatusOK)
 	} else if request.Method == "GET" || sessionId == "" { // stream-down, stream-one
+		remoteAddr := h.resolveRemoteAddr(request)
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
